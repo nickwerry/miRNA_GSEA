@@ -1,0 +1,355 @@
+---
+title: "miRNA_GSEA"
+author: "Nick Werry"
+date: "11/12/2020"
+output: html_document
+params:
+  miRNA_A:
+    label: "First miRNA of interest"
+    input: text
+    value: "hsa-miR-100-5p"
+  miRNA_B:
+    label: "Second miRNA of interest"
+    input: text
+    value: "miR-125b-5p"
+  Databases:
+    label: "Search databases for interactions that are: (default: validated)"
+    input: radio
+    choices: ["validated","predicted"]
+    value: "validated"
+---
+
+<!-- USE this line in the console to knit with custom parameters -->
+<!-- rmarkdown::render("Assignment 2_knit_w_params.Rmd", params = "ask") -->
+
+```{r Setup, echo = FALSE}
+library(knitr)
+
+#Tidy output
+opts_chunk$set(tidy = TRUE, cache=FALSE)
+
+#Format for kables
+options(knitr.table.format = 'markdown')
+```
+
+```{r Libraries, echo = FALSE, message = FALSE, warning = FALSE}
+if ("tidyverse" %in% rownames(installed.packages()) == FALSE) {install.packages("tidyverse")}
+library(tidyverse)
+if ("BiocManager" %in% rownames(installed.packages()) == FALSE) {install.packages("BiocManager")}
+library(BiocManager)
+if ("multiMiR" %in% rownames(installed.packages()) == FALSE) {BiocManager::install("multiMiR")}
+library(multiMiR)
+if ("org.Bt.eg.db" %in% rownames(installed.packages()) == FALSE) {BiocManager::install("org.Bt.eg.db")}
+library(org.Bt.eg.db) #BOVINE DATABASE FOR GO
+if ("limma" %in% rownames(installed.packages()) == FALSE) {BiocManager::install("limma")}
+library(limma)
+if ("ggplot2" %in% rownames(installed.packages()) == FALSE) {install.packages("ggplot2")}
+library(ggplot2)
+if ("ggpubr" %in% rownames(installed.packages()) == FALSE) {install.packages("ggpubr")}
+library(ggpubr)
+if ("ggVennDiagram" %in% rownames(installed.packages()) == FALSE) {install.packages("ggVennDiagram")}
+library(ggVennDiagram)
+if ("writexl" %in% rownames(installed.packages()) == FALSE) {install.packages("writexl")}
+library(writexl)
+if ("KEGGprofile" %in% rownames(installed.packages()) == FALSE) {install.packages("KEGGprofile")}
+library(KEGGprofile)
+if ("beepr" %in% rownames(installed.packages()) == FALSE) {install.packages("beepr")}
+library(beepr)
+```
+
+```{r Parameters, echo = F}
+#Add miRNA parameters to properly formatted miRNA list
+mirList <- vector(mode = "list")
+for (miR in params){
+  if (str_detect(miR, "miR")){
+    mirList[miR] <- (ifelse(startsWith(miR, "hsa-"), miR, sprintf("hsa-%s", miR)))
+  }
+}
+
+#Create string of abbreviated miRNA pairs as filename
+mirListShort <- vector(mode = "character")
+for (miR in params){
+  if (str_detect(miR, "miR")){
+    mirListShort[miR] <-  str_extract(miR, "(miR\\-)\\w+")
+  }
+}
+
+#Visually appealing string of mirListShort
+mirAmp <- paste(mirListShort, collapse = " & ")
+
+#Variables for filenames
+entrezFile <- sprintf("Outputs %s/Entrez.xlsx", mirAmp)
+tableFile <- sprintf("Outputs %s/GSEA_Table.xlsx", mirAmp)
+chartFile <- sprintf("Outputs %s/GSEA_Chart.png", mirAmp)
+```
+
+```{r Functions, echo = FALSE}
+#Isolate miRNAs and targets, remove missing and duplicated data
+targetClean <- function(miRNA_targets) {
+  genes_df <- data.frame(miRNA_targets@data$mature_mirna_id, miRNA_targets@data$target_entrez) %>%
+    filter(!(miRNA_targets.data.target_entrez == "")) %>%
+    distinct()
+  return(genes_df)
+}
+  
+#Use miRNA inputs to get genes targeted by all miRNA inputs
+targetOverlap <- function(miRNA) {
+  genes_df <- targetClean(miRNA)
+  target_genes <- as.data.frame(table(genes_df$miRNA_targets.data.target_entrez)) %>%
+    filter(Freq == length(mirList)) %>%
+    rename("Var1"="target_entrez")
+  return(target_genes)
+}
+
+#Order data by number of genes, update factors to new order
+reorderGSEA <- function(GSEA) {
+  stopifnot(colnames(GSEA[1]) %in% c("Term", "Pathway")) #Stop if input is invalid
+    if (colnames(GSEA[1]) == "Term") {
+      output <- GSEA %>%
+        arrange(desc(N)) %>%
+        mutate(Term = factor(Term, level = Term))
+    } else {
+      output <- GSEA %>%
+        arrange(desc(N)) %>%
+        mutate(Pathway = factor(Pathway, level = Pathway))
+      }
+  return(output)
+}
+
+#Isolate GO results for a specific ontology, arrange output 
+isolateGO <- function(GO, ontology) {
+  stopifnot(any(str_detect(GO$Ont, ontology))) #Stop if input is invalid
+  output <- GO %>%
+  group_by(Ont) %>%
+  filter(Ont == ontology) %>%
+  reorderGSEA()
+  return(output)
+}
+
+#Subset dataframes, rename columns, output as kable
+kableMaker <- function(GSEA) {
+  title_var <- deparse(substitute(GSEA))
+  if (colnames(GSEA[1]) == "Term") {
+    GSEA[c(1,3)] %>%
+      rename(Term = sprintf("%s Term", title_var), N = "Number of Genes") %>%
+      head(n = 20) %>%
+      kable(format = "simple")
+  } else {
+    GSEA[c(1,2)] %>%
+      rename(Pathway = sprintf("%s Pathway", title_var), N = "Number of Genes") %>%
+      remove_rownames() %>%
+      head(n = 20) %>%
+      kable(format = "simple")
+  }
+}
+
+#Plot top 20 results by number of genes, suitable for both GO and KEGG
+plotGSEA <- function(GSEA) {
+  x_var <- ifelse(colnames(GSEA[1]) == "Term", "Term", "Pathway")
+  ggplot(GSEA[(1:20),], aes_string(x = x_var, y = "N")) + 
+  geom_col() +
+  theme_classic() +
+  ggtitle(deparse(substitute(GSEA))) +
+  ylab("Number of Genes") +
+  scale_y_continuous(expand = c(0,0)) +
+  scale_x_discrete(limits = rev) +
+  coord_flip()
+}
+```
+
+### miRNA Targets\
+Data preview:
+```{r miRNA Targets, message = FALSE, echo = FALSE}
+#Get miRNA target data
+miR_tars <- multiMiR::get_multimir(org = "hsa", mirna = mirList, table = params$Databases)
+
+#Glance at data for relevant columns
+head(miR_tars@data[c(1,3,4,5)])
+```
+
+```{r Individual Targets, echo = FALSE}
+#Get target genes for each miRNA individually
+indv_targets <- targetClean(miR_tars)
+
+miRNA_A <- indv_targets %>%
+  filter(miRNA_targets.data.mature_mirna_id == mirList[1]) %>%
+  dplyr::select(miRNA_targets.data.target_entrez)
+
+miRNA_B <- indv_targets %>%
+  filter(miRNA_targets.data.mature_mirna_id == mirList[2]) %>%
+  dplyr::select(miRNA_targets.data.target_entrez)
+
+indv_targets_list <- c(miRNA_A, miRNA_B)
+names(indv_targets_list) <- mirListShort
+```
+
+```{r Correlated Targets, echo = FALSE}
+#Get target genes shared by input miRNAs
+target_genes <- targetOverlap(miR_tars)
+
+#Create character vector of target genes
+target_genes_char <- as.character(target_genes[1])
+```
+
+Only the `r length(target_genes$target_entrez)` genes targeted by all input miRNAs will be used downstream for GSEA, this plot visualizes the overlap in genes targeted by `r mirAmp`.
+```{r Figure 2, fig.height = 5, fig.width = 10, message = FALSE, echo = FALSE}
+#Plot Venn diagram of targeted genes for each miRNA
+ggVennDiagram(indv_targets_list, label = "both", color = "black") +
+  scale_fill_gradient(low="white", high = "deepskyblue4") +
+  xlab("high")
+```
+
+### GSEA\
+
+GO and KEGG analysis were performed with a false discovery rate (FDR) significance level of 0.05. The top 20 results by number of genes are shown.
+```{r GO Analysis, echo = FALSE}
+#GO  pathway annotation
+GO_all <- limma::goana(target_genes_char, species = "Hs", FDR = 0.05)
+
+#Separate dataframes by ontology, remove rownames and rank by number of genes
+GO_Biological_Process <- isolateGO(GO = GO_all, ontology = "BP")
+GO_Cellular_Component <- isolateGO(GO_all, "CC")
+GO_Molecular_Function <- isolateGO(GO_all, "MF")
+
+#Check ontology categories were properly divided
+stopifnot(identical(length(GO_all$Ont), length(c(GO_Biological_Process$Ont, GO_Cellular_Component$Ont, GO_Molecular_Function$Ont))), TRUE)
+```
+
+```{r KEGG Analysis, echo = FALSE}
+#KEGG pathway annotation
+KEGG_all <- limma::kegga(target_genes_char, species = "Hs", FDR = 0.05)
+
+#Remove rownames and rank by number of genes
+KEGG <- reorderGSEA(KEGG_all)
+```
+
+**Table 1.** GO: Biological Process analysis of genes targeted by `r mirAmp`.
+
+```{r Table 1, echo = FALSE}
+kableMaker(GO_Biological_Process)
+```
+
+**Table 2.** GO: Cellular Component analysis of genes targeted by `r mirAmp`.
+
+
+```{r Table 2, echo = FALSE}
+kableMaker(GO_Cellular_Component)
+```
+
+**Table 3.** GO: Molecular Function analysis of genes targeted by `r mirAmp`.
+
+
+```{r Table 3, echo = FALSE}
+kableMaker(GO_Molecular_Function)
+```
+
+**Table 4.** KEGG analysis of genes targeted by `r mirAmp`.
+
+```{r Table 4, echo = FALSE}
+kableMaker(KEGG)
+```
+
+To better visualize the enriched terms and pathways, the tables are presented as figures. 
+```{r Plots, fig.height = 4, fig.width = 4, echo = FALSE}
+#Create individual plots with proper format
+GO_BP_Plot <- plotGSEA(GO_Biological_Process)
+GO_CC_Plot <- plotGSEA(GO_Cellular_Component)
+GO_MF_Plot <- plotGSEA(GO_Molecular_Function)
+KEGG_Plot <- plotGSEA(KEGG)
+```
+
+```{r Figure 3, fig.height = 10, fig.width = 12, echo = FALSE}
+#Arrange plots into a single figure
+GSEA_Plots <- ggarrange(GO_BP_Plot, GO_CC_Plot, GO_MF_Plot, KEGG_Plot, ncol = 2, nrow = 2, labels = "AUTO", align = "hv")
+
+#Plot figure
+GSEA_Plots
+```
+
+KEGG Pathways represent complex interactomes of several different biochemical elements. The below figure visualizes the factors involved in the most strongly implicated pathway.
+
+```{r Figure 4, out.width= '100%', message = FALSE, echo = FALSE}
+#Get ranked lists of KEGG Pathway IDs and names (corresponds to rank in Figure 2)
+KEGG_paths <- KEGG_all %>%
+  arrange(desc(N)) %>%
+  rownames() %>%
+  stringr::str_replace("path:", "")
+
+KEGG_names <- KEGG_all %>%
+  arrange(desc(N))
+
+#Avoid overly inclusive/uninformative pathway result
+if (KEGG_paths[1] != "hsa01100") {
+  KEGG_top_path <- KEGG_paths[1]
+  KEGG_top_name <- KEGG_names$Pathway[1]
+} else {
+  KEGG_top_path <- KEGG_paths[2]
+  KEGG_top_name <- KEGG_names$Pathway[2]
+}
+
+#Download KEGG file for top result
+download_KEGGfile(pathway_id = str_replace(KEGG_top_path, "hsa", ""), species = "hsa")
+
+#Output top (relevant) KEGG Pathway
+knitr::include_graphics(sprintf("%s.png", KEGG_top_path))
+```
+
+### Save Outputs\
+The tables and figures generated here provide information and visualizations that may be useful in publication or other contexts outside of an R environment. The following files have been saved:
+
+```{r Save Outputs, results = "hold", fig.height = 10, fig.width = 12, warning = FALSE, echo = FALSE}
+#Folder to save output files, leading "_" to easily find when sorting alphabetically
+dir.create(sprintf("Outputs %s", mirAmp))
+
+#Save entrez IDs targeted by both miRNAs to excel file
+writexl::write_xlsx(as.data.frame(target_genes$target_entrez), path = entrezFile)
+
+#Save tables of GSEA terms/pathways to excel file
+write_xlsx(list(GO_BP = GO_Biological_Process, GO_CC = GO_Cellular_Component, GO_MF = GO_Molecular_Function, KEGG = KEGG), path = tableFile)
+
+#Save figure of GSEA terms/pathways to png file
+ggsave(plot = GSEA_Plots, filename = chartFile, dpi = 300)
+```
+
+```{r Display Save Locations, echo = FALSE}
+sprintf("%s/%s", getwd(), entrezFile)
+sprintf("%s/%s", getwd(), tableFile)
+sprintf("%s/%s", getwd(), chartFile)
+```
+
+
+```{r End, echo = FALSE}
+#Alert user that computation is finished. Note: may not run on windows machines.
+if (.Platform$OS.type == "unix") {
+  system("say Analysis is complete!")
+} else {
+  beepr::beep(3)
+}
+```
+
+## Technical Resources\
+To solve coding problems
+
+UC Denver (2014). The multiMiR R package and database. http://multimir.ucdenver.edu
+
+StackOverflow (2013). Break/exit script. https://stackoverflow.com/questions/17837289/break-exit-script
+
+Jennybc (2014). Reverse the order of a categorical axis in ggplot2. https://gist.github.com/jennybc/6f3fa527b915b920fdd5#gistcomment-3471801
+
+Datamentor. R if...else Statement. https://www.datamentor.io/r-programming/if-else-statement/
+
+StackOverflow (2014). How to use a specific volumn name in ggplot. https://stackoverflow.com/questions/22309285/how-to-use-a-variable-to-specify-column-name-in-ggplot
+
+STHDA (2017). ggpubr: Publication Ready Plots. http://www.sthda.com/english/articles/24-ggpubr-publication-ready-plots/81-ggplot2-easy-way-to-mix-multiple-graphs-on-the-same-page/
+
+Kassambara (2019) Resize the multipanel plot in ggarrange(). https://github.com/kassambara/ggpubr/issues/226
+
+StackOverflow (2017). Extract name of data.frame in R as character. https://stackoverflow.com/questions/45176431/extract-name-of-data-frame-in-r-as-character/45176503
+
+StackOverflow (2016). Y axis won't start a 0 in ggplot. https://stackoverflow.com/questions/36669095/y-axis-wont-start-at-0-in-ggplot
+
+StackOverflow (2010). Is there a way to make R beep/play a sound at the end of a script? https://stackoverflow.com/questions/3365657/is-there-a-way-to-make-r-beep-play-a-sound-at-the-end-of-a-script
+
+StackOverflow (2018). R: deterine if a script is running in Windows or Linux. https://stackoverflow.com/questions/2096473/r-determine-if-a-script-is-running-in-windows-or-linux
+
+Holly Emblem (2018). Renaming columns with dplyr in R. https://medium.com/@HollyEmblem/renaming-columns-with-dplyr-in-r-55b42222cbdc
